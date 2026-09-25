@@ -1,6 +1,6 @@
 cask "turtletask" do
-  version "0.2.4"
-  sha256 "7b190527958f613bdb2e9c65ab36f166321659c5a3fa71618cd1181ae801f828"
+  version "0.2.5"
+  sha256 "b839191752972ade8162aa5bea35200ab1fdbcc358f0e26ec3d354ebb8692f2e"
 
   url "https://github.com/reindance/homebrew-turtletask/releases/download/desktop-v#{version}/TurtleTask_#{version}_universal.dmg"
   name "TurtleTask"
