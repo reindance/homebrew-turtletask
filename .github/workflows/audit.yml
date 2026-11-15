@@ -22,5 +22,7 @@ jobs:
           if [ ! -f Casks/turtletask.rb ]; then echo "no cask yet"; exit 0; fi
           tap="$(brew --repository)/Library/Taps/reindance/homebrew-turtletask"
           mkdir -p "$(dirname "$tap")" && ln -s "$PWD" "$tap"
+          # Homebrew refuses casks from a tap it has not been told to trust.
+          brew trust reindance/turtletask
           brew style reindance/turtletask/turtletask
           brew audit --cask --online --strict reindance/turtletask/turtletask
