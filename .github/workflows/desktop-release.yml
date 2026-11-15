@@ -1,0 +1,247 @@
+# Builds and releases the TurtleTask desktop app. It lives in this PUBLIC tap
+# so the builds run on GitHub's free standard runners (macOS, Windows and
+# Ubuntu included); the source stays in the private arksigma/turtletask,
+# checked out here at the release tag with a read-only token and never
+# persisted. The pattern follows arksigma/gannet-dist.
+#
+# Flow: check out arksigma/turtletask at desktop-vX.Y.Z -> build macOS
+# (universal, signed and notarised when the Apple secrets are set), Windows
+# and Linux (Ubuntu 22.04, for the glibc floor of the AppImage/.deb/.rpm) ->
+# write the updater manifest latest.json -> GitHub release on this repo ->
+# regenerate Casks/turtletask.rb on main -> audit the new cask.
+#
+# Triggers (no pull_request: secrets never reach a fork's code):
+#   - repository_dispatch "desktop-release" with {"tag": "desktop-vX.Y.Z"},
+#     sent by arksigma/turtletask's desktop-release.yml when the tag is pushed
+#   - workflow_dispatch with a tag (manual or recovery; dry_run builds only)
+#
+# Secrets on THIS repo:
+#   SOURCE_TOKEN       fine-grained PAT, Contents: read on arksigma/turtletask
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#                      the updater's minisign key; the app only installs
+#                      updates that verify against its public half
+# Optional (macOS signing and notarisation; ad-hoc signed otherwise):
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+# Publishing uses this run's own GITHUB_TOKEN.
+
+name: Desktop release
+
+on:
+  repository_dispatch:
+    types: [desktop-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to build (e.g. desktop-v0.3.0)"
+        required: true
+      dry_run:
+        description: "Build only, publish nothing"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: arksigma/turtletask
+  RELEASE_TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+
+concurrency:
+  group: desktop-release-${{ inputs.tag || github.event.client_payload.tag }}
+
+jobs:
+  # A bad token or tag fails in seconds, not after half an hour of builds.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The tag names a desktop release
+        run: |
+          [[ "$RELEASE_TAG" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a desktop tag: '$RELEASE_TAG'"; exit 1; }
+      - name: The source token can read the tag
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          gh api "repos/$SOURCE_REPO/git/ref/tags/$RELEASE_TAG" --jq .ref
+          echo "SOURCE_TOKEN can read $RELEASE_TAG in $SOURCE_REPO"
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            args: --target universal-apple-darwin
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: windows-latest
+            args: ""
+            targets: ""
+          - os: ubuntu-22.04
+            args: ""
+            targets: ""
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - name: The tag must match the app's version
+        run: |
+          v=$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")
+          [ "desktop-v$v" = "$RELEASE_TAG" ] || { echo "tag $RELEASE_TAG does not match version $v"; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            src/desktop/package-lock.json
+            src/frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src/desktop/src-tauri
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
+
+      # The desktop UI imports the web app's lib by path; both trees need
+      # their packages.
+      - run: npm ci
+        working-directory: src/frontend
+      - run: npm ci
+        working-directory: src/desktop
+
+      # An unset secret arrives as an empty string, and an empty
+      # APPLE_CERTIFICATE still makes the bundler try to import it. Only
+      # export what is actually set; with nothing set the app is ad-hoc
+      # signed (bundle.macOS.signingIdentity "-").
+      - name: Apple signing secrets, when present
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -n "${!v}" ]; then
+              printf '%s<<__EOF__\n%s\n__EOF__\n' "$v" "${!v}" >> "$GITHUB_ENV"
+              echo "$v set"
+            fi
+          done
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          # linuxdeploy is itself an AppImage; run it unpacked so a runner
+          # without FUSE still bundles.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: src/desktop
+          args: ${{ matrix.args }}
+
+      - name: Collect the installers
+        run: |
+          mkdir -p ../out
+          find desktop/src-tauri/target -path '*/release/bundle/*' \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o -name '*.app.tar.gz' -o -name '*.sig' \) -exec cp {} ../out/ \;
+          ls -la ../out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: out/*
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run == 'true') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tap
+
+      # The release scripts live with the source, at the same tag.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: desktop/scripts
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Write the update manifest
+        run: src/desktop/scripts/make-manifest.sh "$RELEASE_TAG" installers > installers/latest.json && cat installers/latest.json
+
+      - name: Release the installers
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: main
+          name: TurtleTask Desktop ${{ env.RELEASE_TAG }}
+          files: installers/*
+          fail_on_unmatched_files: true
+          body: |
+            The TurtleTask desktop app. macOS: `brew install --cask reindance/turtletask/turtletask`
+            (signed and notarised). Windows: the `-setup.exe`. Linux: the `.AppImage`, `.deb` or `.rpm`.
+
+      - name: Regenerate the cask
+        run: |
+          version=${RELEASE_TAG#desktop-v}
+          dmg=$(compgen -G 'installers/*_universal.dmg' | head -1)
+          sha=$(sha256sum "$dmg" | cut -d' ' -f1)
+          src/desktop/scripts/make-cask.sh "$version" "$sha" > tap/Casks/turtletask.rb
+          cd tap
+          git config user.name "turtletask-release"
+          git config user.email "release@turtletask.app"
+          git add Casks/turtletask.rb
+          git commit -m "turtletask $version"
+          git push origin HEAD:main
+
+  # A push made with GITHUB_TOKEN starts no workflow, so audit.yml would not
+  # see the new cask: audit it here, on main as just pushed.
+  audit:
+    needs: publish
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Audit the cask
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tap="$(brew --repository)/Library/Taps/reindance/homebrew-turtletask"
+          mkdir -p "$(dirname "$tap")" && ln -s "$PWD" "$tap"
+          brew style reindance/turtletask/turtletask
+          brew audit --cask --online --strict reindance/turtletask/turtletask
