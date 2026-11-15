@@ -1,0 +1,230 @@
+# Tests, builds and releases tt, the TurtleTask CLI. Like desktop-release.yml
+# it lives in this PUBLIC tap so it runs on GitHub's free standard runners;
+# the source stays in the private arksigma/turtletask, checked out at the
+# release tag with a read-only token and never persisted.
+#
+# Flow: check out arksigma/turtletask at cli-vX.Y.Z -> the CLI's own tests and
+# the end-to-end script against the real backend -> single-file binaries for
+# macOS (ad-hoc signed, which only macOS can do), Linux and Windows, each run
+# on its own OS -> GitHub release on this repo (never "latest": the desktop
+# app's updater reads releases/latest) -> regenerate Formula/turtletask-cli.rb
+# on main.
+#
+# Triggers (no pull_request: secrets never reach a fork's code):
+#   - repository_dispatch "cli-release" with {"tag": "cli-vX.Y.Z"}, sent by
+#     arksigma/turtletask's cli-release.yml when the tag is pushed
+#   - workflow_dispatch with a tag (manual or recovery; dry_run builds only)
+#
+# Secret on THIS repo: SOURCE_TOKEN (Contents: read on arksigma/turtletask).
+# Publishing uses this run's own GITHUB_TOKEN.
+
+name: CLI release
+
+on:
+  repository_dispatch:
+    types: [cli-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to build (e.g. cli-v0.3.0)"
+        required: true
+      dry_run:
+        description: "Test and build only, publish nothing"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: arksigma/turtletask
+  RELEASE_TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+
+concurrency:
+  group: cli-release-${{ inputs.tag || github.event.client_payload.tag }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The tag names a CLI release
+        run: |
+          [[ "$RELEASE_TAG" =~ ^cli-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a CLI tag: '$RELEASE_TAG'"; exit 1; }
+      - name: The source token can read the tag
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          gh api "repos/$SOURCE_REPO/git/ref/tags/$RELEASE_TAG" --jq .ref
+          echo "SOURCE_TOKEN can read $RELEASE_TAG in $SOURCE_REPO"
+
+  test:
+    needs: preflight
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - name: The tag must match the CLI's version
+        run: |
+          v=$(jq -r .version cli/package.json)
+          [ "cli-v$v" = "$RELEASE_TAG" ] || { echo "tag $RELEASE_TAG does not match version $v"; exit 1; }
+
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: src/backend/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/frontend/package-lock.json
+
+      - run: bun install --frozen-lockfile
+        working-directory: src/cli
+      # tt imports the web app's lib, whose types reach svelte's: the type
+      # check needs the frontend's packages (the binary does not).
+      - run: npm ci --ignore-scripts
+        working-directory: src/frontend
+      - run: bun run check
+        working-directory: src/cli
+      - run: bun test
+        working-directory: src/cli
+
+      - name: End to end against the real backend
+        run: |
+          pip install -r backend/requirements.txt
+          sudo apt-get install -y zsh
+          cli/scripts/e2e.sh
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS binaries are signed (ad hoc), which only macOS can do.
+          - os: macos-latest
+            targets: darwin-arm64 darwin-x64
+            native: darwin-arm64
+          - os: ubuntu-latest
+            targets: linux-x64 linux-arm64 windows-x64
+            native: linux-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        working-directory: src/cli
+
+      - run: cli/scripts/build.sh ${{ matrix.targets }}
+
+      - name: The native binary runs and knows its version
+        run: |
+          v=$(jq -r .version cli/package.json)
+          got=$(TT_NO_UPDATE_CHECK=1 cli/out/${{ matrix.native }}/tt --version)
+          [ "$got" = "$v" ] || { echo "tt --version said $got, wanted $v"; exit 1; }
+          set +e; TT_CONFIG_DIR=$(mktemp -d) cli/out/${{ matrix.native }}/tt whoami; code=$?; set -e
+          [ $code -eq 3 ] || { echo "whoami signed out exited $code, wanted 3"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tt-${{ matrix.os }}
+          path: |
+            src/cli/out/*.tar.gz
+            src/cli/out/*.zip
+          retention-days: 3
+          if-no-files-found: error
+
+  windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tt-ubuntu-latest
+          path: archives
+      - name: The Windows binary runs and knows its version
+        shell: bash
+        run: |
+          v=${RELEASE_TAG#cli-v}
+          unzip -q "archives/tt-$v-windows-x64.zip" -d bin
+          got=$(TT_NO_UPDATE_CHECK=1 bin/tt.exe --version | tr -d '\r')
+          [ "$got" = "$v" ] || { echo "tt.exe --version said $got, wanted $v"; exit 1; }
+
+  publish:
+    needs: [build, windows]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run == 'true') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tap
+
+      # The formula script lives with the source, at the same tag.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: cli/scripts
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: archives
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd archives && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release the archives
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: main
+          name: tt (TurtleTask CLI) ${{ env.RELEASE_TAG }}
+          files: archives/*
+          fail_on_unmatched_files: true
+          # The desktop app's updater reads releases/latest; a CLI release
+          # must never become it.
+          make_latest: "false"
+          body: |
+            `tt`, TurtleTask from the terminal. macOS and Linux:
+            `brew install reindance/turtletask/turtletask-cli`. Or download the
+            archive for your system, put `tt` on your PATH, and run `tt login`.
+            Checksums in SHA256SUMS.
+
+      - name: Regenerate the formula
+        run: |
+          version=${RELEASE_TAG#cli-v}
+          mkdir -p tap/Formula
+          src/cli/scripts/make-formula.sh "$version" archives > tap/Formula/turtletask-cli.rb
+          cd tap
+          git config user.name "turtletask-release"
+          git config user.email "release@turtletask.app"
+          git add Formula/turtletask-cli.rb
+          git commit -m "turtletask-cli $version"
+          git push origin HEAD:main
