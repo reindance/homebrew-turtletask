@@ -1,27 +1,27 @@
 class TurtletaskCli < Formula
   desc "TurtleTask from the terminal: what needs you, add work, decide on it"
   homepage "https://turtletask.app/"
-  version "0.3.0"
+  version "0.4.0"
 
   on_macos do
     on_arm do
       url "https://github.com/reindance/homebrew-turtletask/releases/download/cli-v#{version}/tt-#{version}-darwin-arm64.tar.gz"
-      sha256 "0bcb1e82bab696f282edab01343dd2f1076daeb878518a33d4427e58bc196b68"
+      sha256 "0710de791eeab4057e858edca4f4eff8dbb467b08fab90e891e04dbeba3be455"
     end
     on_intel do
       url "https://github.com/reindance/homebrew-turtletask/releases/download/cli-v#{version}/tt-#{version}-darwin-x64.tar.gz"
-      sha256 "4d57e171287db8ece9769912ad2818c72aab45fbac7a84516fdb2a8b356d62aa"
+      sha256 "33ca617b471177e25666293243547c3f77214f1f5c4001fcb35cdcc3aaa3f36d"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/reindance/homebrew-turtletask/releases/download/cli-v#{version}/tt-#{version}-linux-arm64.tar.gz"
-      sha256 "8b2a08863ec7ffea115331252dbc763d214f1b6fc505e84f6546d294355287a2"
+      sha256 "452e50bcb38c8d86e4e99559c3e710c3daa82d3ea21fec203e0716e8853c1ab6"
     end
     on_intel do
       url "https://github.com/reindance/homebrew-turtletask/releases/download/cli-v#{version}/tt-#{version}-linux-x64.tar.gz"
-      sha256 "4eb29953e3db7051c02e7bd37b714dc60181c8458f603bf776e70d240a11d1a7"
+      sha256 "e6e49000858bd0d5612942539e929382c9cb45e4fe92bcd64bc672ddd936d21d"
     end
   end
 
